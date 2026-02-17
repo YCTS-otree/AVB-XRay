@@ -1,9 +1,9 @@
 # compare_avb_keys_multi.py
-# 多 PEM 对比 + 识别 Algorithm NONE + 语义化 vbmeta/vbmeta_system 输入
+# 多 PEM 对比 + 识别 Algorithm NONE + 自动识别镜像类型
 #
 # 示例：
 #   python compare_avb_keys_multi.py --key .\pem\testkey_rsa4096.pem --key .\pem\testkey_rsa2048.pem ^
-#       --vbmeta .\vbmeta_b.img --vbmeta_system .\vbmeta_system_b.img --boot .\boot_b.img --vendor_boot .\vendor_boot_b.img
+#       --vbmeta .\vbmeta_b.img --vbmeta_system .\vbmeta_system_b.img --boot .\boot_b.img --image .\vendor_boot_b.img
 #
 # 说明：
 # - 私钥侧：avbtool extract_public_key --key <pem> 导出公钥，然后算 sha1/sha256
@@ -164,18 +164,87 @@ def fmt_pems(pems: List[Path]) -> str:
         return "(no match)"
     return " | ".join(str(p.name) for p in pems)
 
+def detect_image_label(path: Path) -> str:
+    stem = path.stem.lower()
+    stem = re.sub(r"_(a|b)$", "", stem)
+    known = [
+        "vbmeta_system",
+        "vbmeta_vendor",
+        "vendor_kernel_boot",
+        "vendor_boot",
+        "init_boot",
+        "vbmeta",
+        "boot",
+        "dtbo",
+    ]
+    for k in known:
+        if stem == k or stem.startswith(f"{k}_"):
+            return k
+    return stem
+
+def prompt_existing_paths(title: str) -> List[Path]:
+    paths: List[Path] = []
+    while True:
+        raw = input(f"{title}（为空则下一步）: ").strip()
+        if not raw:
+            break
+        p = Path(raw).expanduser().resolve()
+        if not p.exists():
+            print(f"[!] 文件不存在：{p}")
+            continue
+        paths.append(p)
+    return paths
+
+def build_image_entries(args: argparse.Namespace) -> List[Tuple[str, Path]]:
+    items: List[Tuple[str, Path]] = []
+    for name in ("vbmeta", "vbmeta_system", "boot", "dtbo"):
+        value = getattr(args, name, None)
+        if value:
+            p = Path(value).expanduser().resolve()
+            items.append((name, p))
+
+    for raw in args.image or []:
+        p = Path(raw).expanduser().resolve()
+        items.append((detect_image_label(p), p))
+
+    dedup = []
+    seen = set()
+    for n, p in items:
+        if p in seen:
+            continue
+        seen.add(p)
+        dedup.append((n, p))
+    return dedup
+
 def main():
-    ap = argparse.ArgumentParser(description="多 PEM 对比：vbmeta/vbmeta_system/boot/vendor_boot 等镜像的 AVB key（SHA1+SHA256），并识别 Algorithm NONE")
-    ap.add_argument("--key", action="append", required=True, help="PEM 私钥路径（可重复传多个）")
+    ap = argparse.ArgumentParser(description="多 PEM 对比：分析任意 AVB 镜像的 key（SHA1+SHA256），并识别 Algorithm NONE")
+    ap.add_argument("--key", action="append", help="PEM 私钥路径（可重复传多个）")
     ap.add_argument("--vbmeta", help="vbmeta.img 路径（主 vbmeta）")
     ap.add_argument("--vbmeta_system", help="vbmeta_system.img 路径")
     ap.add_argument("--boot", help="boot.img 路径")
-    ap.add_argument("--vendor_boot", help="vendor_boot.img 路径")
     ap.add_argument("--dtbo", help="dtbo.img 路径")
+    ap.add_argument("--image", action="append", help="任意 AVB image 路径（可重复传多个，自动识别 vbmeta/boot 等）")
     args = ap.parse_args()
 
+    has_cli_inputs = any([
+        args.key,
+        args.vbmeta,
+        args.vbmeta_system,
+        args.boot,
+        args.dtbo,
+        args.image,
+    ])
+
+    if not has_cli_inputs:
+        print("未检测到启动参数，进入交互模式。")
+        args.key = [str(p) for p in prompt_existing_paths("PEM")]
+        args.image = [str(p) for p in prompt_existing_paths("img")]
+
     # 收集 PEM
-    pem_paths = [Path(p).resolve() for p in args.key]
+    pem_paths = [Path(p).expanduser().resolve() for p in (args.key or [])]
+    if not pem_paths:
+        print("至少提供一个 PEM（--key 或交互输入）。")
+        sys.exit(2)
     for p in pem_paths:
         if not p.exists():
             raise FileNotFoundError(f"找不到 PEM：{p}")
@@ -190,17 +259,7 @@ def main():
     print()
 
     # 收集镜像
-    images = []
-    if args.vbmeta:
-        images.append(("vbmeta", Path(args.vbmeta).resolve()))
-    if args.vbmeta_system:
-        images.append(("vbmeta_system", Path(args.vbmeta_system).resolve()))
-    if args.boot:
-        images.append(("boot", Path(args.boot).resolve()))
-    if args.vendor_boot:
-        images.append(("vendor_boot", Path(args.vendor_boot).resolve()))
-    if args.dtbo:
-        images.append(("dtbo", Path(args.dtbo).resolve()))
+    images = build_image_entries(args)
 
     if not images:
         print("至少传入一个镜像（推荐 vbmeta + vbmeta_system）。")
@@ -215,12 +274,14 @@ def main():
         parsed = info_image(img)
         algo = parsed["algorithm"] or "(unknown)"
 
-        print(f"\n[{name}] {img}")
-        print(f"  Algorithm           : {algo}")
+        print("\n" + "=" * 80)
+        print(f"[{name}] {img}")
+        print("-" * 80)
+        print(f"Algorithm            : {algo}")
 
         # Algorithm NONE：不是报错，而是告诉你“这块本身不带签名”
         if algo.upper() == "NONE":
-            print("  Note                : Algorithm NONE 表示该 image 自带的 vbmeta 不签名/不含公钥；是否被验证取决于上级 vbmeta 是否包含它的 hash/hashtree/chain descriptor。")
+            print("Note                 : Algorithm NONE 表示该 image 自带的 vbmeta 不签名/不含公钥；是否被验证取决于上级 vbmeta 是否包含它的 hash/hashtree/chain descriptor。")
 
         # 顶层 key 匹配（如果有）
         top_sha1 = parsed["top_sha1"]
@@ -228,31 +289,31 @@ def main():
 
         if top_sha1:
             hits = best_match(top_sha1, keys, "sha1")
-            print(f"  Top pubkey sha1     : {top_sha1}  -> {fmt_pems(hits)}")
+            print(f"Top pubkey sha1      : {top_sha1}  -> {fmt_pems(hits)}")
         else:
-            print("  Top pubkey sha1     : (not found)")
+            print("Top pubkey sha1      : (not found)")
 
         if top_sha256:
             hits = best_match(top_sha256, keys, "sha256")
-            print(f"  Top pubkey sha256   : {top_sha256}  -> {fmt_pems(hits)}")
+            print(f"Top pubkey sha256    : {top_sha256}  -> {fmt_pems(hits)}")
         else:
-            print("  Top pubkey sha256   : (not found)")
+            print("Top pubkey sha256    : (not found)")
 
         # chain keys（主要出现在 vbmeta）
         if parsed["chains"]:
-            print("  -- Chain Partition keys --")
+            print("Chain Partition keys :")
             for c in parsed["chains"]:
                 part = c["partition"] or "(unknown)"
                 if c["sha1"]:
                     hits = best_match(c["sha1"], keys, "sha1")
-                    print(f"  {part:<16} sha1 : {c['sha1']}  -> {fmt_pems(hits)}")
+                    print(f"  - {part:<14} sha1   : {c['sha1']}  -> {fmt_pems(hits)}")
                 else:
-                    print(f"  {part:<16} sha1 : (not found)")
+                    print(f"  - {part:<14} sha1   : (not found)")
                 if c["sha256"]:
                     hits = best_match(c["sha256"], keys, "sha256")
-                    print(f"  {part:<16} sha256: {c['sha256']}  -> {fmt_pems(hits)}")
+                    print(f"  - {part:<14} sha256 : {c['sha256']}  -> {fmt_pems(hits)}")
                 else:
-                    print(f"  {part:<16} sha256: (not found)")
+                    print(f"  - {part:<14} sha256 : (not found)")
 
         # 关键：列出 descriptors 里引用的分区，帮助你判断“到底验证了谁”
         if parsed["referenced_parts"]:
@@ -260,17 +321,14 @@ def main():
             parts = parsed["referenced_parts"]
             show = parts[:50]
             suffix = "" if len(parts) <= 50 else f" ...(+{len(parts)-50})"
-            print(f"  Referenced partitions: {', '.join(show)}{suffix}")
-
-            # 特别提示 vendor_boot
-            if "vendor_boot" in parts:
-                print("  ✅ vendor_boot 在该 vbmeta 的 descriptors 中出现（说明它被这张 vbmeta 纳入验证描述）。")
-            else:
-                print("  ❔ vendor_boot 未在该输出的 Partition Name 列表出现（可能由另一张 vbmeta/链负责，或输出节选/格式差异导致没匹配到）。")
+            print(f"Referenced partitions: {', '.join(show)}{suffix}")
         else:
-            print("  Referenced partitions: (none parsed)")
+            print("Referenced partitions: (none parsed)")
 
     print("\n提示：如果你确认设备只有 vbmeta + vbmeta_system 两张 vbmeta，理论上它们就足以覆盖 system/vendor/boot/vendor_boot 等多数分区的验证描述。关键是看 descriptors 里有没有提到对应分区。")
+
+    if not has_cli_inputs:
+        input("按任意键退出")
 
 if __name__ == "__main__":
     main()

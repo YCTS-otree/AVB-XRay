@@ -1,6 +1,8 @@
 # AVB-XRay
 Visualize and Compare Android Verified Boot Key Chains
 
+中文文档：[`README.zh-CN.md`](README.zh-CN.md)
+
 AVB-XRay is a Python utility that inspects Android AVB images (`vbmeta`, `vbmeta_system`, `boot`, `vendor_boot`, etc.) and compares their embedded public keys against multiple PEM private keys.
 
 It helps you:
@@ -29,6 +31,7 @@ This tool is especially useful for:
 - Full partition reference extraction from descriptors
 - Intelligent `Algorithm NONE` interpretation
 - Clear terminal output with semantic hints
+- Interactive mode when started without arguments
 
 ---
 
@@ -80,8 +83,10 @@ python compare_avb_keys_multi.py \
   --vbmeta .\vbmeta_b.img \
   --vbmeta_system .\vbmeta_system_b.img \
   --boot .\boot_b.img \
-  --vendor_boot .\vendor_boot_b.img
+  --image .\vendor_boot_b.img
 ```
+
+If no arguments are provided, the script enters interactive mode and asks for PEM/image paths.
 
 ---
 
